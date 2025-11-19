@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Resume Document Assistant</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        // set worker for pdf.js
+        // NOTE: This must be set before any other pdf.js calls.
+        if (typeof pdfjsLib !== 'undefined') {
+            pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+        }
+    </script>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.4.2/mammoth.browser.min.js"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #f7f9fc; }
+        textarea::-webkit-scrollbar { width: 8px; }
+        textarea::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 4px; }
+        .container { max-width: 1200px; }
+    </style>
+
+    <script>
+        /* ------------------------- CONSTANTS ------------------------------ */
+        // !! IMPORTANT: REPLACE THE PLACEHOLDER BELOW WITH YOUR ACTUAL, VALID GEMINI API KEY !!
+        const API_KEY = "AIzaSyDMaXLMvnMXl-m29emVtfEthIxSyIhFE5s"; // <-- REPLACE WITH YOUR KEY
+        const MODEL_NAME = "gemini-2.5-flash-preview-09-2025";
+        const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${API_KEY}`;
+
+        /* -------------------- RETRY HANDLER ------------------------ */
+        async function fetchWithRetry(url, options, maxRetries = 5) {
+            for (let attempt = 0; attempt < maxRetries; attempt++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.status === 429) {
+                        const delay = Math.pow(2, attempt) * 1000;
+                        await new Promise(res => setTimeout(res, delay));
+                        continue;
+                    }
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        console.error(`Detailed HTTP Error (${response.status}):`, errorText);
+                        // Throw a detailed error including the status code and text for the catch block
+                        throw new Error(`HTTP Error: ${response.status} - ${errorText.substring(0, 100)}...`); 
+                    }
+                    return await response.json();
+                } catch (e) {
+                    if (attempt === maxRetries - 1) throw e;
+                    await new Promise(res => setTimeout(res, 1000));
+                }
+            }
+        }
+
+        function setLoading(isLoading, elementId = 'loading-indicator') {
+            const loadingIndicator = document.getElementById(elementId);
+            if (loadingIndicator) loadingIndicator.classList.toggle('hidden', !isLoading);
+            document.querySelectorAll('button').forEach(btn => {
+                if (btn.id !== 'download-btn') {
+                    btn.disabled = isLoading;
+                    btn.classList.toggle('opacity-50', isLoading);
+                    btn.classList.toggle('cursor-not-allowed', isLoading);
+                }
+            });
+        }
+
+        /* ----------------------- PDF READER ------------------------- */
+        async function readPDF(file) {
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                let extracted = "";
+
+                for (let i = 1; i <= pdf.numPages; i++) {
+                    const page = await pdf.getPage(i);
+                    const textContent = await page.getTextContent();
+                    const text = textContent.items.map(item => item.str).join(' ');
+                    // FIX: Replaced illegal newline character with '\n'
+                    extracted += text + "\n\n"; 
+                }
+
+                return extracted;
+            } catch (err) {
+                console.error('readPDF error', err);
+                throw new Error("Could not extract text from PDF. Check console for details.");
+            }
+        }
+
+        /* ----------------------- DOCX READER ------------------------- */
+        async function readDOCX(file) {
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                // Ensure mammoth is defined from the CDN
+                if (typeof mammoth === 'undefined' || !mammoth.extractRawText) {
+                    throw new Error("Mammoth.js not loaded correctly for DOCX reading.");
+                }
+                const result = await mammoth.extractRawText({ arrayBuffer });
+                return result.value;
+            } catch (err) {
+                console.error('readDOCX error', err);
+                throw new Error("Could not extract text from DOCX. Check console for details.");
+            }
+        }
+
+        /* ----------------------- FILE HANDLER (Auto Read) ------------------------- */
+        async function handleFileChange(event) {
+            const file = event.target.files && event.target.files[0];
+            const textarea = document.getElementById('resume-text');
+            const info = document.getElementById('file-name');
+
+            if (!file) {
+                info.textContent = 'No file selected';
+                textarea.value = '';
+                return;
+            }
+
+            textarea.value = `Processing: ${file.name}... Please wait.`;
+            info.textContent = `Reading: ${file.name}`;
+
+            let text = "";
+
+            try {
+                const lower = file.name.toLowerCase();
+                if (lower.endsWith('.pdf')) {
+                    info.textContent = `Reading PDF: ${file.name} — extracting text...`;
+                    text = await readPDF(file);
+                } else if (lower.endsWith('.docx')) {
+                    info.textContent = `Reading DOCX: ${file.name} — extracting text...`;
+                    text = await readDOCX(file);
+                } else if (file.type === 'text/plain' || lower.endsWith('.txt')) {
+                    info.textContent = `Reading TXT: ${file.name}`;
+                    text = await file.text();
+                } else {
+                    textarea.value = "Unsupported file type. Use PDF, DOCX, or TXT.";
+                    info.textContent = `Unsupported file: ${file.name}`;
+                    return;
+                }
+
+                // Put extracted text into textarea and AUTO-ANALYZE for TXT/PDF/DOCX
+                textarea.value = text.trim();
+                info.textContent = `Loaded: ${file.name} (Text Extracted)`;
+
+                // Automatically start the analysis after successful extraction
+                analyzeResume(); 
+
+            } catch (err) {
+                console.error('handleFileChange error', err);
+                textarea.value = `Error reading file (${file.name}): ${err.message}. Please paste the text manually.`;
+                info.textContent = `Error: ${file.name}`;
+            }
+        }
+
+        /* ---------------------- AI ANALYSIS ----------------------- */
+        async function analyzeResume() {
+            const resumeText = document.getElementById('resume-text').value.trim();
+            const output = document.getElementById('output-resume');
+
+            if (!resumeText || resumeText.length < 20) {
+                output.value = "Please paste or upload a resume (minimum 20 characters) and then click Analyze.";
+                return;
+            }
+
+            setLoading(true);
+            output.value = "Analyzing resume for grammar, weak verbs, formatting issues and suggestions...";
+
+            // System prompt to instruct the model for analysis
+            const systemPrompt = "You are a world-class Resume Analyst. Review the text for grammar errors, weak actions verbs, formatting issues, and provide a constructive, detailed critique. Do NOT output a new resume — only analysis and a list of detected mistakes and suggestions.";
+
+            const userQuery = `Resume to analyze:
+---
+${resumeText}
+---
+Please point out grammar mistakes, weak verbs, unclear sentences, and formatting issues.`;
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: { parts: [{ text: systemPrompt }] }
+            };
+
+            try {
+                const result = await fetchWithRetry(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const analysis = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                output.value = analysis || "AI returned no analysis. Check API key / quota / console for details.";
+
+            } catch (e) {
+                console.error('analyzeResume error', e);
+                output.value = `Error analyzing resume: ${e.message || e}`;
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        /* ---------------------- RESUME REFINER ----------------------- */
+        async function generateRefinedResume() {
+            const resumeText = document.getElementById('resume-text').value.trim();
+            const commands = document.getElementById('command-input').value.trim();
+            const output = document.getElementById('output-resume');
+
+            if (!resumeText || resumeText.length < 20) {
+                output.value = "Provide resume text first (paste or upload) before generating refined resume.";
+                return;
+            }
+
+            setLoading(true);
+            output.value = "Generating refined resume (grammar corrections + professional formatting)...";
+
+            const systemPrompt = `You are a professional Resume Generator and Editor.
+1) Correct grammar and improve sentence clarity.
+2) Replace weak verbs with strong action verbs.
+3) Output a refined, professional resume using standard sections (Contact, Summary, Experience, Education, Skills).
+4) Output ONLY the final resume text — no commentary.`;
+
+            const userQuery = `Original Resume:
+---
+${resumeText}
+---
+User Commands:
+---
+${commands || 'Refine and format professionally.'}
+---`;
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: { parts: [{ text: systemPrompt }] }
+            };
+
+            try {
+                const result = await fetchWithRetry(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const refined = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                output.value = refined || "AI failed to return a refined resume. Check API / console.";
+
+            } catch (e) {
+                console.error('generateRefinedResume error', e);
+                output.value = `Error generating refined resume: ${e.message || e}`;
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        /* ---------------------- ATS SCORING (FIXED) ----------------------- */
+        async function calculateScore() {
+            const resume = document.getElementById('resume-text').value.trim();
+            const jd = document.getElementById('jd-text').value.trim();
+            const card = document.getElementById('score-card');
+
+            if (!resume || !jd) {
+                card.innerHTML = `<p class='text-red-500'>Missing resume or JD. Paste both first.</p>`;
+                return;
+            }
+
+            setLoading(true, 'scoring-loading-indicator');
+            card.innerHTML = `<p class="text-gray-600 animate-pulse">Calculating fit score and detailed analysis...</p>`;
+
+
+            // MODIFIED SYSTEM PROMPT: Now requests a clear SCORE token for easier parsing.
+            const systemPrompt = `You are an expert ATS/HR resume scanner. Your task is to compare the RESUME against the JOB DESCRIPTION.
+You MUST begin your response with a suitability score in the format: "SCORE: [percentage]%"
+For example: "SCORE: 75%"
+After the score, provide:
+1.  **Score Interpretation:** Explain the score based on these ranges: 0-50 (Low Fit), 50-65 (Moderate Fit), 65-100 (Good Fit).
+2.  **Detailed Analysis:** A bulleted list of strengths (how they match) and weaknesses/gaps compared to the JD.`;
+            
+            const userQuery = `Resume:
+---
+${resume}
+---
+Job Description:
+---
+${jd}
+---
+Provide your analysis.`;
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: { parts: [{ text: systemPrompt }] }
+                // Removed the responseSchema config to avoid HTTP 400 errors
+            };
+
+            try {
+                const result = await fetchWithRetry(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const resultText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                // Parse the score from the text response
+                const scoreMatch = resultText.match(/SCORE: (\d+)%/);
+                const score = scoreMatch ? parseInt(scoreMatch[1], 10) : null;
+                
+                if (score !== null) {
+                    // Remove the score line before passing the analysis
+                    const analysis = resultText.replace(/SCORE: \d+%\n?/, '').trim();
+                    updateScoreCard(score, analysis);
+                } else {
+                    card.innerHTML = `<p class='text-red-500'>AI analysis failed to return a score. Raw output: ${resultText}. Ensure your prompt is clear.</p>`;
+                }
+
+            } catch (e) {
+                console.error('calculateScore error', e);
+                // Enhanced error message
+                const errorMessage = (e.message && e.message.includes('400')) ? 
+                                     "Error scoring (HTTP 400). This is almost always an issue with your **API Key** (invalid, expired, or quota exceeded). Please verify your key." : 
+                                     `Error scoring: ${e.message || e}.`;
+                card.innerHTML = `<p class='text-red-500'>${errorMessage}</p>`;
+            } finally {
+                setLoading(false, 'scoring-loading-indicator');
+            }
+        }
+        
+        // Helper function to render the score card correctly
+        function updateScoreCard(score, analysis) {
+            const scoreCard = document.getElementById('score-card');
+            let color, category;
+
+            if (score <= 50) {
+                color = 'bg-red-500';
+                category = "Low Fit: Major Gaps Identified (0-50%)";
+            } else if (score <= 65) {
+                color = 'bg-yellow-500';
+                category = "Moderate Fit: Needs Significant Work (50%-65%)";
+            } else {
+                color = 'bg-green-500';
+                category = "Good Fit: Strong Alignment (65%-100%)";
+            }
+            
+            const progressBarWidth = Math.min(100, score);
+
+            scoreCard.innerHTML = `
+                <div class="space-y-4">
+                    <div class="flex items-center justify-between p-4 rounded-lg ${color} text-white shadow-lg">
+                        <div class="text-2xl font-bold">Fit Score: ${score}%</div>
+                        <div class="text-lg font-medium">${category}</div>
+                    </div>
+                    <div class="w-full bg-gray-200 rounded-full h-2.5">
+                        <div class="h-2.5 rounded-full ${color}" style="width: ${progressBarWidth}%"></div>
+                    </div>
+                    <h3 class="text-xl font-semibold text-gray-800 border-b pb-1 mt-4">Detailed ATS Analysis</h3>
+                    <div class="bg-white p-4 rounded-lg border border-gray-200 whitespace-pre-wrap text-gray-700">
+                        ${analysis}
+                    </div>
+                </div>
+            `;
+        }
+
+        /* ---------------------- DOWNLOAD ----------------------- */
+        function downloadDocx() {
+            const text = document.getElementById('output-resume').value;
+            if (!text.trim()) {
+                const btn = document.getElementById('download-btn');
+                const original = btn.textContent;
+                btn.textContent = 'Generate resume first';
+                btn.classList.add('bg-red-500');
+                setTimeout(() => { btn.textContent = original; btn.classList.remove('bg-red-500'); }, 2000);
+                return;
+            }
+
+            const a = document.createElement('a');
+            a.href = 'data:text/plain;charset=utf-8,' + encodeURIComponent(text);
+            // Saves as a TXT file containing the refined text
+            a.download = "refined_resume.txt"; 
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+    </script>
+</head>
+<body class="p-6">
+
+    <div class="container mx-auto">
+        <h1 class="text-4xl font-extrabold text-center mb-10 text-gray-900">
+            <span class="text-indigo-600">AI</span> Resume Refinement & ATS Scorer
+        </h1>
+
+        <div class="grid lg:grid-cols-2 gap-8">
+
+            <div class="space-y-6">
+                <div class="bg-white p-6 rounded-xl shadow-lg border">
+                    <h2 class="text-2xl font-semibold mb-4">1. Upload Resume (PDF / DOCX / TXT)</h2>
+
+                    <input type="file" id="file-upload" accept=".pdf,.docx,.txt" onchange="handleFileChange(event)"
+                        class="block w-full text-sm file:bg-indigo-50 file:px-4 file:py-2 file:rounded-full" />
+
+                    <p id="file-name" class="text-xs text-gray-500 mt-2">No file selected</p>
+
+                    <label for="resume-text" class="block text-sm font-medium text-gray-700 mb-1 mt-2">Extracted/Pasted Resume Text:</label>
+                    <textarea id="resume-text" rows="10" placeholder="Paste the complete text of your resume here..." 
+                                 class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150 ease-in-out resize-y"></textarea>
+
+                    <button onclick="analyzeResume()" class="w-full mt-4 py-2 px-4 bg-gray-600 text-white font-semibold rounded-lg shadow-md hover:bg-gray-700">Analyze Resume</button>
+                </div>
+
+                <div class="bg-white p-6 rounded-xl shadow-lg border space-y-6">
+                    <h2 class="text-2xl font-semibold">3. JD for ATS Score</h2>
+
+                    <textarea id="jd-text" rows="6" class="w-full p-3 border rounded" placeholder="Paste Job Description here"></textarea>
+
+                    <div id="scoring-loading-indicator" class="hidden p-2 text-center">
+                        <div class="animate-spin h-6 w-6 border-b-2 border-indigo-600 mx-auto"></div>
+                    </div>
+
+                    <button onclick="calculateScore()" class="w-full py-2 bg-indigo-600 text-white rounded">Calculate ATS Score</button>
+
+                    <h2 class="text-2xl font-semibold pt-4 border-t">2. Additional Editing Commands</h2>
+
+                    <textarea id="command-input" rows="4" class="w-full p-3 border rounded" placeholder="Example: Change dates to MM/YYYY, add volunteer experience to summary"></textarea>
+
+                    <button onclick="generateRefinedResume()" class="w-full py-2 bg-green-600 text-white rounded">Generate Refined Resume</button>
+                </div>
+            </div>
+
+            <div class="space-y-6">
+
+                <div class="bg-white p-6 rounded-xl shadow-lg border">
+                    <h2 class="text-2xl font-semibold mb-4">ATS Scorecard</h2>
+                    <div id="score-card" class="p-4 bg-gray-50 rounded border">Enter resume and JD to score.</div>
+                </div>
+
+                <div class="bg-white p-6 rounded-xl shadow-lg border">
+                    <h2 class="text-2xl font-semibold mb-4">Refined Resume</h2>
+
+                    <div id="loading-indicator" class="hidden text-center p-4">
+                        <div class="animate-spin h-8 w-8 border-b-2 border-indigo-600 mx-auto"></div>
+                        <p class="mt-2 text-indigo-600">AI Processing...</p>
+                    </div>
+
+                    <textarea id="output-resume" rows="20" class="w-full p-4 border rounded bg-gray-50" readonly></textarea>
+
+                    <button id="download-btn" onclick="downloadDocx()" class="w-full mt-4 py-2 bg-indigo-500 text-white rounded">
+                        Download Refined Resume
+                    </button>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</body>
+</html>
